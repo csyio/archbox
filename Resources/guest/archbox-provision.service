@@ -1,0 +1,15 @@
+[Unit]
+Description=ArchBox installer
+Wants=network-online.target
+After=network-online.target systemd-networkd.service
+
+[Service]
+Type=oneshot
+# If the script is killed outright, power off so the app sees the install end.
+FailureAction=poweroff
+ExecStart=/usr/local/bin/archbox-provision
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

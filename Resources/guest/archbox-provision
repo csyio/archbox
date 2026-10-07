@@ -1,0 +1,318 @@
+#!/bin/bash
+# Runs inside the temporary in-memory installer system.
+# Installs Arch Linux ARM with KDE Plasma onto the first disk, then powers off.
+# The rootfs tarball arrives as the second, raw read-only disk.
+# Everything is logged to the serial console (hvc0); the macOS app parses
+# lines starting with "@@STEP" and "@@STATUS" from it.
+
+set -Eeuo pipefail
+
+TARGET=/mnt
+
+# serial-getty@hvc0 is masked in the installer: agetty's vhangup() on the
+# console would otherwise SIGHUP this script mid-install.
+trap '' HUP
+exec >/dev/hvc0 2>&1
+
+finish() {
+    FINISHED=1
+    sync
+    echo "@@STATUS $1"
+    systemctl poweroff
+}
+trap 'echo "ERROR: line $LINENO: $BASH_COMMAND"; finish failed' ERR
+# Exits the ERR trap does not see (set -u, a failed command after "trap - ERR")
+# must still report and power off, or the app would wait forever.
+trap 'rc=$?; [ -n "${FINISHED:-}" ] || { echo "ERROR: exited early (status $rc)"; finish failed; }' EXIT
+
+# Any HTTP answer from the mirror means the network works (ICMP may be blocked).
+online() { curl -sI --max-time 10 -o /dev/null http://mirror.archlinuxarm.org/; }
+
+step() { echo "@@STEP $1|$2"; }
+
+# shellcheck source=/dev/null
+source /etc/archbox/config.env
+
+DISK=$ARCHBOX_DISK                  # /dev/vda (virtio) or /dev/nvme0n1 (NVMe)
+TARBALL_DISK=$ARCHBOX_TARBALL_DISK
+# NVMe controllers probe in parallel, so nvme0/nvme1 may come up swapped.
+# Tell them apart by size: the target is 128 GiB, the tarball disk under 1 GiB.
+for _ in $(seq 30); do [ -b "$DISK" ] && [ -b "$TARBALL_DISK" ] && break; sleep 1; done
+sectors() { cat "/sys/block/${1#/dev/}/size"; }
+if [ "$(sectors "$DISK")" -lt "$(sectors "$TARBALL_DISK")" ]; then
+    DISK=$ARCHBOX_TARBALL_DISK
+    TARBALL_DISK=$ARCHBOX_DISK
+fi
+echo "Target disk: $DISK ($(sectors "$DISK") sectors), tarball disk: $TARBALL_DISK"
+case "$DISK" in
+*[0-9]) PART=${DISK}p ;;            # /dev/nvme0n1 -> /dev/nvme0n1p1
+*) PART=$DISK ;;                    # /dev/vda -> /dev/vda1
+esac
+
+# Development only: ARCHBOX_TEST=network|local runs a stress test instead of installing.
+if [ -n "${ARCHBOX_TEST:-}" ]; then
+    echo "@@STEP 1|Stress test: $ARCHBOX_TEST"
+    if [ "$(date +%s)" -lt "$ARCHBOX_NOW" ]; then date -s "@$ARCHBOX_NOW"; fi
+    case "$ARCHBOX_TEST" in
+    network)
+        until online; do sleep 2; done
+        url=https://fl.us.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+        for _ in 1 2 3 4; do (trap - ERR; curl -s -r 0-199999999 -o /dev/null "$url" || true) & done
+        wait
+        echo "network round done"
+        ;;
+    ram)
+        mkdir -p /dev/shm/x
+        head -c "$ARCHBOX_TARBALL_SIZE" "$TARBALL_DISK" >/dev/shm/rootfs.tar.gz
+        for round in 1 2 3; do
+            bsdtar -xpf /dev/shm/rootfs.tar.gz -C /dev/shm/x
+            head -c 3G /dev/urandom | sha256sum
+            rm -rf /dev/shm/x/*
+            echo "ram round $round done"
+        done
+        ;;
+    local)
+        mkfs.ext4 -F -q "$DISK"
+        mount "$DISK" /mnt
+        for round in 1 2 3; do
+            bsdtar -xpf <(trap - ERR; head -c "$ARCHBOX_TARBALL_SIZE" "$TARBALL_DISK" || true) -C /mnt
+            head -c 3G /dev/urandom | sha256sum
+            rm -rf /mnt/*
+            echo "local round $round done"
+        done
+        umount /mnt
+        ;;
+    esac
+    echo "@@STEP 6|Stress test finished"
+    finish ok
+    exit 0
+fi
+
+ch() {
+    chroot "$TARGET" /usr/bin/env -i HOME=/root TERM=dumb LANG=C.UTF-8 \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/bin "$@"
+}
+
+# ---------------------------------------------------------------------------
+step 1 "Preparing the installer"
+
+# Diagnostics for the log: kernel, memory and CPU features (MTE etc.).
+uname -r
+grep -m1 '^Features' /proc/cpuinfo || true
+dmesg | grep -iE 'cpu features|mte|memory:' || true
+
+# The VM may start with a wrong clock; pacman signature checks need a sane one.
+if [ "$(date +%s)" -lt "$ARCHBOX_NOW" ]; then
+    date -s "@$ARCHBOX_NOW"
+fi
+
+for _ in $(seq 60); do
+    online && break
+    sleep 2
+done
+online
+
+# ---------------------------------------------------------------------------
+step 2 "Partitioning the disk"
+
+udevadm settle
+wipefs -af "$DISK"
+sfdisk "$DISK" <<EOF
+label: gpt
+size=1GiB, type=uefi, name=ESP
+type=b921b045-1df0-41c3-af44-4c6f280d3fae, name=root
+EOF
+udevadm settle
+mkfs.ext4 -F -q -L archroot "${PART}2"
+mount "${PART}2" "$TARGET"
+
+# ---------------------------------------------------------------------------
+step 3 "Copying the base system"
+
+# Process substitution, not a pipe: bsdtar may stop reading early and pipefail
+# would turn the resulting SIGPIPE in head into an error.
+bsdtar -xpf <(trap - ERR; head -c "$ARCHBOX_TARBALL_SIZE" "$TARBALL_DISK" || true) -C "$TARGET"
+
+mount -t proc proc "$TARGET/proc"
+mount --rbind /sys "$TARGET/sys" && mount --make-rslave "$TARGET/sys"
+mount --rbind /dev "$TARGET/dev" && mount --make-rslave "$TARGET/dev"
+mount --bind /run "$TARGET/run"
+mount -t tmpfs tmpfs "$TARGET/tmp"
+
+# awk reads all input (no "exit"): an early exit could SIGPIPE ip and, with pipefail, fail the install.
+gateway=$(ip route | awk '/^default/ && !g {g = $3} END {print g}')
+rm -f "$TARGET/etc/resolv.conf"
+printf 'nameserver %s\nnameserver 1.1.1.1\n' "$gateway" >"$TARGET/etc/resolv.conf"
+
+# ---------------------------------------------------------------------------
+step 4 "Initializing package keys"
+
+sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 8/' "$TARGET/etc/pacman.conf"
+ch pacman-key --init
+ch pacman-key --populate archlinuxarm
+
+# ---------------------------------------------------------------------------
+step 5 "Updating the base system"
+
+ch pacman -Syu --noconfirm --needed dosfstools
+
+# Move /boot onto the EFI system partition.
+ch mkfs.fat -F32 -n ARCHESP "${PART}1"
+mv "$TARGET/boot" "$TARGET/boot.orig"
+mkdir "$TARGET/boot"
+mount "${PART}1" "$TARGET/boot"
+cp -r "$TARGET/boot.orig/Image" "$TARGET/boot.orig/initramfs-linux.img" "$TARGET/boot/"
+rm -rf "$TARGET/boot.orig"
+
+# ---------------------------------------------------------------------------
+step 6 "Installing KDE Plasma (the longest step)"
+
+wanted=(
+    sudo networkmanager xorg-server
+    plasma-meta sddm konsole dolphin kate ark spectacle gwenview okular
+    firefox
+    pipewire pipewire-alsa pipewire-pulse wireplumber
+    noto-fonts noto-fonts-emoji noto-fonts-cjk
+    spice-vdagent xdg-user-dirs bash-completion
+    nano vim git base-devel htop fastfetch man-db openssh
+)
+pkgs=()
+for p in "${wanted[@]}"; do
+    if ch pacman -Si "$p" >/dev/null 2>&1 || ch pacman -Sg "$p" >/dev/null 2>&1; then
+        pkgs+=("$p")
+    else
+        echo "WARNING: package not available, skipped: $p"
+    fi
+done
+ch pacman -S --noconfirm --needed "${pkgs[@]}"
+
+# ---------------------------------------------------------------------------
+step 7 "Configuring the system"
+
+echo "$ARCHBOX_HOSTNAME" >"$TARGET/etc/hostname"
+ln -sf "/usr/share/zoneinfo/$ARCHBOX_TIMEZONE" "$TARGET/etc/localtime"
+sed -i 's/^#\(en_US.UTF-8 UTF-8\)/\1/; s/^#\(tr_TR.UTF-8 UTF-8\)/\1/' "$TARGET/etc/locale.gen"
+ch locale-gen
+cat >"$TARGET/etc/locale.conf" <<EOF
+LANG=en_US.UTF-8
+LC_TIME=tr_TR.UTF-8
+LC_MONETARY=tr_TR.UTF-8
+LC_PAPER=tr_TR.UTF-8
+LC_MEASUREMENT=tr_TR.UTF-8
+EOF
+echo "KEYMAP=$ARCHBOX_CONSOLE_KEYMAP" >"$TARGET/etc/vconsole.conf"
+mkdir -p "$TARGET/etc/X11/xorg.conf.d"
+cat >"$TARGET/etc/X11/xorg.conf.d/00-keyboard.conf" <<EOF
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "$ARCHBOX_XKB_LAYOUT"
+EndSection
+EOF
+
+cat >"$TARGET/etc/fstab" <<EOF
+LABEL=archroot  /      ext4  rw,relatime  0 1
+LABEL=ARCHESP   /boot  vfat  rw,relatime,fmask=0077,dmask=0077  0 2
+archbox-shared  /home/$ARCHBOX_USER/Mac  virtiofs  rw,nofail  0 0
+EOF
+
+# Users: drop the default "alarm" account, lock root, use sudo.
+ch userdel -r alarm || true
+ch useradd -m -G wheel -s /bin/bash -c "$ARCHBOX_FULLNAME" "$ARCHBOX_USER"
+printf '%s:%s\n' "$ARCHBOX_USER" "$ARCHBOX_PASSWORD" | ch chpasswd
+ch passwd -l root
+echo '%wheel ALL=(ALL:ALL) ALL' >"$TARGET/etc/sudoers.d/10-wheel"
+chmod 440 "$TARGET/etc/sudoers.d/10-wheel"
+
+home="$TARGET/home/$ARCHBOX_USER"
+mkdir -p "$home/Mac" "$home/.config"
+cat >"$home/.config/kxkbrc" <<EOF
+[Layout]
+LayoutList=$ARCHBOX_XKB_LAYOUT
+Use=true
+EOF
+# A VM does not need an automatic screen lock; the Mac already has one.
+cat >"$home/.config/kscreenlockerrc" <<EOF
+[Daemon]
+Autolock=false
+LockOnResume=false
+EOF
+# First Plasma login: match the Mac's Retina scale, then remove itself.
+cat >"$TARGET/usr/local/bin/archbox-firstrun" <<EOF
+#!/bin/sh
+kscreen-doctor output.1.scale.$ARCHBOX_DISPLAY_SCALE
+rm -f "\$HOME/.config/autostart/archbox-firstrun.desktop"
+EOF
+chmod 755 "$TARGET/usr/local/bin/archbox-firstrun"
+mkdir -p "$home/.config/autostart"
+cat >"$home/.config/autostart/archbox-firstrun.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=ArchBox first run
+Exec=/usr/local/bin/archbox-firstrun
+X-KDE-autostart-phase=2
+EOF
+ch chown -R "$ARCHBOX_USER:$ARCHBOX_USER" "/home/$ARCHBOX_USER"
+
+# After the Mac resumes a saved VM the guest clock is behind; poll NTP often
+# so it is corrected within a minute instead of up to half an hour.
+mkdir -p "$TARGET/etc/systemd/timesyncd.conf.d"
+cat >"$TARGET/etc/systemd/timesyncd.conf.d/archbox.conf" <<EOF
+[Time]
+PollIntervalMaxSec=64
+EOF
+
+# Log straight into Plasma.
+session=plasma
+[ -f "$TARGET/usr/share/wayland-sessions/plasma.desktop" ] || session=plasmawayland
+mkdir -p "$TARGET/etc/sddm.conf.d"
+cat >"$TARGET/etc/sddm.conf.d/archbox.conf" <<EOF
+[Autologin]
+User=$ARCHBOX_USER
+Session=$session
+
+[Theme]
+Current=breeze
+EOF
+
+# Network: NetworkManager replaces systemd-networkd so Plasma can manage it.
+rm -f "$TARGET"/etc/systemd/network/{en,eth}.network
+ch systemctl disable systemd-networkd.service systemd-networkd.socket \
+    systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+ln -sf /run/systemd/resolve/stub-resolv.conf "$TARGET/etc/resolv.conf"
+ch systemctl enable sddm.service NetworkManager.service systemd-resolved.service \
+    systemd-timesyncd.service
+ch systemctl enable spice-vdagentd.socket >/dev/null 2>&1 || true
+# Suspending the guest only freezes the window; the host handles sleep.
+ch systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+ch systemd-machine-id-setup
+
+# ---------------------------------------------------------------------------
+step 8 "Installing the boot loader"
+
+sed -i 's/^MODULES=(.*)/MODULES=(virtio_pci virtio_blk virtio_gpu virtio_net virtiofs)/' \
+    "$TARGET/etc/mkinitcpio.conf"
+ch mkinitcpio -P
+ch bootctl install --no-variables --esp-path=/boot
+cat >"$TARGET/boot/loader/loader.conf" <<EOF
+default arch.conf
+timeout 0
+editor no
+EOF
+cat >"$TARGET/boot/loader/entries/arch.conf" <<EOF
+title   Arch Linux ARM
+linux   /Image
+initrd  /initramfs-linux.img
+options root=LABEL=archroot rw quiet loglevel=3 systemd.firstboot=off console=hvc0 console=tty1
+EOF
+
+# ---------------------------------------------------------------------------
+step 9 "Finishing"
+
+ch gpgconf --homedir /etc/pacman.d/gnupg --kill all || true
+rm -rf "$TARGET"/var/cache/pacman/pkg/*
+sync
+trap - ERR
+umount -R "$TARGET" || umount -lR "$TARGET"
+step 10 "Done"
+finish ok
