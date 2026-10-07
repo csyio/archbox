@@ -30,6 +30,8 @@ enum Paths {
     static let machineIdentifier = root.appendingPathComponent("machine-identifier.bin")
     static let macAddress = root.appendingPathComponent("mac-address.txt")
     static let savedState = root.appendingPathComponent("saved-state.vzvmsave")
+    /// The optional devices the saved state was taken with; a restore needs the same set.
+    static let savedStateDevices = root.appendingPathComponent("saved-state-devices.json")
     static let console = root.appendingPathComponent("console.log")
     static let installedMarker = root.appendingPathComponent("installed")
 

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Called by wl-paste --watch with the new clipboard text on stdin. Writes it to
+# the X11 clipboard unless X11 already holds the same text (which is the case
+# when the text came from the Mac or from an X11 app): that check stops loops.
+# wl-paste sets CLIPBOARD_STATE: "nil" when the clipboard was cleared and
+# "sensitive" for password-manager entries. Neither goes to the Mac.
+[ "${CLIPBOARD_STATE:-data}" = data ] || exit 0
+new=$(mktemp)
+trap 'rm -f "$new"' EXIT
+cat >"$new"
+if ! xclip -selection clipboard -o 2>/dev/null | cmp -s - "$new"; then
+    xclip -selection clipboard -i "$new"
+fi

@@ -49,7 +49,16 @@ enum VMConfig {
 
     // MARK: - Desktop
 
-    static func desktop(displayPixels: CGSize) throws -> VZVirtualMachineConfiguration {
+    /// `microphone`: attach the Mac's microphone. Only when the app has microphone
+    /// permission; otherwise Linux would wait on a capture device that never delivers.
+    /// Devices that depend on the Mac (permission, Rosetta) and must stay the same
+    /// between saving and restoring the VM state.
+    struct OptionalDevices: Codable, Equatable {
+        var microphone: Bool
+        var rosetta: Bool
+    }
+
+    static func desktop(displayPixels: CGSize, devices: OptionalDevices) throws -> VZVirtualMachineConfiguration {
         let config = base()
 
         let bootLoader = VZEFIBootLoader()
@@ -68,6 +77,25 @@ enum VMConfig {
 
         config.storageDevices = [try disk()]
         config.directorySharingDevices = [share(tag: "archbox-shared", url: Paths.sharedFolder)]
+
+        // Rosetta runs x86_64 Linux binaries; the guest mounts it at /media/rosetta.
+        if devices.rosetta, let rosetta = try? VZLinuxRosettaDirectoryShare() {
+            let device = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
+            device.share = rosetta
+            config.directorySharingDevices.append(device)
+        }
+
+        // Speakers and microphone (the guest builds the virtio_snd driver itself).
+        let output = VZVirtioSoundDeviceOutputStreamConfiguration()
+        output.sink = VZHostAudioOutputStreamSink()
+        let sound = VZVirtioSoundDeviceConfiguration()
+        sound.streams = [output]
+        if devices.microphone {
+            let input = VZVirtioSoundDeviceInputStreamConfiguration()
+            input.source = VZHostAudioInputStreamSource()
+            sound.streams.append(input)
+        }
+        config.audioDevices = [sound]
 
         // Clipboard sharing through the SPICE agent (spice-vdagent in the guest).
         let spicePort = VZVirtioConsolePortConfiguration()

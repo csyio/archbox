@@ -22,6 +22,8 @@
     <string>14.0</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Lets apps in the Arch Linux virtual machine use your microphone while the machine is running.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

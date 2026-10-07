@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Virtualization
 
@@ -9,6 +10,9 @@ final class DesktopController: NSObject, NSWindowDelegate, VZVirtualMachineDeleg
     private let machineView = VZVirtualMachineView()
     private var machine: VZVirtualMachine?
     private var canSaveState = false
+    private var displayPixels = CGSize.zero
+    /// The optional devices of the running machine, recorded with a saved state.
+    private var devices = VMConfig.OptionalDevices(microphone: false, rosetta: false)
     private var isClosing = false
     private var closeCompletions: [() -> Void] = []
 
@@ -40,18 +44,56 @@ final class DesktopController: NSObject, NSWindowDelegate, VZVirtualMachineDeleg
         }
         installKeyMonitor()
 
+        displayPixels = pixels
+
+        // A saved state restores only into the same set of devices it was saved with.
+        if FileManager.default.fileExists(atPath: Paths.savedState.path),
+           let data = try? Data(contentsOf: Paths.savedStateDevices),
+           let saved = try? JSONDecoder().decode(VMConfig.OptionalDevices.self, from: data) {
+            startMachine(devices: saved)
+            return
+        }
+        currentDevices { self.startMachine(devices: $0) }
+    }
+
+    /// What this Mac offers right now. The microphone is used by the Virtualization
+    /// XPC service, where macOS denies it silently; the app itself has to ask first.
+    private func currentDevices(_ completion: @escaping (VMConfig.OptionalDevices) -> Void) {
+        let rosetta = VZLinuxRosettaDirectoryShare.availability == .installed
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            completion(.init(microphone: true, rosetta: rosetta))
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async { completion(.init(microphone: granted, rosetta: rosetta)) }
+            }
+        default:
+            completion(.init(microphone: false, rosetta: rosetta))
+        }
+    }
+
+    private func startMachine(devices: VMConfig.OptionalDevices) {
         do {
-            let config = try VMConfig.desktop(displayPixels: pixels)
-            canSaveState = (try? config.validateSaveRestoreSupport()) != nil
+            let config = try makeConfiguration(devices: devices)
             let machine = makeMachine(config)
             if canSaveState, FileManager.default.fileExists(atPath: Paths.savedState.path) {
-                resume(machine, config: config)
+                resume(machine)
             } else {
+                // A state that cannot be restored now must not be restored later
+                // either: the disk changes from this boot on.
+                Self.removeSavedState()
                 boot(machine)
             }
         } catch {
             showFatal("Sanal makine yapılandırılamadı: \(error.localizedDescription)")
         }
+    }
+
+    private func makeConfiguration(devices: VMConfig.OptionalDevices) throws -> VZVirtualMachineConfiguration {
+        let config = try VMConfig.desktop(displayPixels: displayPixels, devices: devices)
+        self.devices = devices
+        canSaveState = (try? config.validateSaveRestoreSupport()) != nil
+        return config
     }
 
     /// The machine view forwards every key to Linux, ⌘ included (as the Meta key).
@@ -88,40 +130,52 @@ final class DesktopController: NSObject, NSWindowDelegate, VZVirtualMachineDeleg
         }
     }
 
-    private func resume(_ machine: VZVirtualMachine, config: VZVirtualMachineConfiguration) {
+    private func resume(_ machine: VZVirtualMachine) {
         machine.restoreMachineStateFrom(url: Paths.savedState) { [weak self] error in
             // A saved state is only valid once; the disk changes after resuming.
-            try? FileManager.default.removeItem(at: Paths.savedState)
+            Self.removeSavedState()
             guard let self else { return }
             if let error {
                 NSLog("ArchBox: restore failed, cold booting: \(error)")
-                self.coldBoot(replacing: machine, config: config)
+                self.coldBoot(replacing: machine)
                 return
             }
             machine.resume { [weak self] result in
                 if case .failure(let error) = result {
                     NSLog("ArchBox: resume failed, cold booting: \(error)")
-                    self?.coldBoot(replacing: machine, config: config)
+                    self?.coldBoot(replacing: machine)
                 }
             }
         }
     }
 
-    /// The restored machine may still hold disk.img; stop it before booting a fresh one.
-    private func coldBoot(replacing old: VZVirtualMachine, config: VZVirtualMachineConfiguration) {
-        guard old.canStop else {
-            boot(makeMachine(config))
-            return
-        }
-        old.stop { [weak self] _ in
-            guard let self else { return }
+    private static func removeSavedState() {
+        try? FileManager.default.removeItem(at: Paths.savedState)
+        try? FileManager.default.removeItem(at: Paths.savedStateDevices)
+    }
+
+    /// The restored machine may still hold disk.img; stop it before booting a fresh one,
+    /// built with the devices this Mac offers now rather than the saved ones.
+    private func coldBoot(replacing old: VZVirtualMachine) {
+        let bootFresh = {
             // The user quit while the old machine was stopping: don't start a new one.
             if self.isClosing {
                 self.finishClosing()
-            } else {
-                self.boot(self.makeMachine(config))
+                return
+            }
+            self.currentDevices { devices in
+                do {
+                    self.boot(self.makeMachine(try self.makeConfiguration(devices: devices)))
+                } catch {
+                    self.showFatal("Sanal makine yapılandırılamadı: \(error.localizedDescription)")
+                }
             }
         }
+        guard old.canStop else {
+            bootFresh()
+            return
+        }
+        old.stop { _ in bootFresh() }
     }
 
     // MARK: - Closing
@@ -150,9 +204,12 @@ final class DesktopController: NSObject, NSWindowDelegate, VZVirtualMachineDeleg
             machine.saveMachineStateTo(url: Paths.savedState) { error in
                 if let error {
                     NSLog("ArchBox: save failed, shutting down instead: \(error)")
-                    try? FileManager.default.removeItem(at: Paths.savedState)
+                    Self.removeSavedState()
                     machine.resume { _ in self.shutDown(machine) }
                     return
+                }
+                if let data = try? JSONEncoder().encode(self.devices) {
+                    try? data.write(to: Paths.savedStateDevices, options: .atomic)
                 }
                 machine.stop { _ in self.finishClosing() }
             }

@@ -4,6 +4,17 @@ A macOS app that runs Arch Linux ARM with KDE Plasma as a full-screen virtual ma
 
 Built on Apple's Virtualization framework. There is no QEMU and no UTM.
 
+## Install
+
+1. Download `ArchBox-<version>.zip` from [Releases](https://github.com/csyio/archbox/releases), unzip it and move `ArchBox.app` to `/Applications`.
+2. Open it. If macOS says it cannot verify the app, that release is not notarized. Open **System Settings → Privacy & Security**, scroll down to the message about ArchBox, and click **Open Anyway**.
+3. Choose a user name and password. The install takes 10–20 minutes, depending on your connection.
+4. When macOS asks, allow microphone access if Linux apps should use the microphone.
+
+Each release zip has a build provenance attestation. To check that a zip was built by this repository's release workflow, run `gh attestation verify ArchBox-<version>.zip --repo csyio/archbox`.
+
+**What the VM can reach on your Mac:** the `~/ArchShared` folder, the clipboard (text), and, if you allowed it, the microphone, whenever the VM is running. Passwords you copy on the Mac are visible to Linux while it runs. ArchBox turns off Klipper's on-disk clipboard history. Its Wayland-to-X11 bridge skips cleared clipboards and password-manager entries, but KWin copies the clipboard to X11 on its own while an X11 app has focus, and `spice-vdagent` passes on whatever X11 holds. A password copied in Linux can therefore still reach the Mac. To remove microphone access later, use **System Settings → Privacy & Security → Microphone**.
+
 ## Requirements
 
 - Apple Silicon Mac
@@ -20,10 +31,11 @@ Built on Apple's Virtualization framework. There is no QEMU and no UTM.
    - extracts the rootfs and updates it with `pacman`
    - installs KDE Plasma, SDDM, NetworkManager, PipeWire, Firefox and the base development tools
    - creates the user account, with sudo through the `wheel` group, and enables automatic login
+   - builds the virtio sound driver with DKMS, and sets up Rosetta and clipboard sharing
    - installs systemd-boot
 4. **Desktop.** Later launches boot the installed disk through `VZEFIBootLoader`. Kernel updates through `pacman -Syu` work as they do on any other Arch install.
 
-Closing the window saves the VM state to disk. The next launch resumes from that point. If the saved state cannot be restored, the VM boots from scratch.
+Closing the window saves the VM state to disk. The next launch resumes from that point, with the same devices the state was saved with (microphone and Rosetta can change between launches). If the saved state cannot be restored, the VM boots from scratch with the devices available at that point.
 
 ## Integration
 
@@ -31,11 +43,17 @@ Closing the window saves the VM state to disk. The next launch resumes from that
 | --- | --- |
 | Display resizes with the window | Yes (`automaticallyReconfiguresDisplay`) |
 | Shared folder | `~/ArchShared` on the Mac is mounted at `~/Mac` in Arch |
-| Clipboard | SPICE agent (`spice-vdagent`); limited under Wayland |
+| Clipboard | Text, in both directions. See [Clipboard](#clipboard). |
+| Sound | Speakers. The Arch Linux ARM kernel is built without `virtio_snd`, so the installer builds [the upstream driver](Resources/guest/virtio-snd) with DKMS. DKMS rebuilds it after kernel updates. |
+| Microphone | Only after macOS grants ArchBox microphone access. Without access the guest gets no input device. PipeWire shows it as "Virtio 1.0 sound Pro 1" (a WirePlumber rule picks the Pro Audio profile, the only one with an input). |
+| x86_64 programs | Through Rosetta, mounted at `/media/rosetta` and registered with binfmt_misc. This needs Rosetta on the Mac (`softwareupdate --install-rosetta`); ArchBox picks it up at the next cold start. |
 | Network | NAT |
 | Disk | NVMe controller (see [Known issues](#known-issues)) |
-| Audio | Not available. The Arch Linux ARM kernel is built without `virtio_snd`. |
-| 3D acceleration | No. The display is virtio-gpu 2D and Plasma renders with llvmpipe. |
+| 3D acceleration | No. Virtualization.framework gives Linux guests a 2D virtio-gpu only, so Plasma renders with llvmpipe. Code cannot change that. |
+
+### Clipboard
+
+Virtualization.framework shares the clipboard through a SPICE agent. `spice-vdagent` only understands X11, so ArchBox runs it against XWayland. KWin copies X11 text to Wayland apps on its own. The reverse only happens while an X11 window has focus. `archbox-clipboard-bridge` covers that direction: it watches the Wayland clipboard with `wl-paste --watch` and copies new text to X11 with `xclip`. Only text is shared, not images or files.
 
 ## Known issues
 
@@ -57,7 +75,9 @@ The crash rate did not change with 1 CPU, with 4 GB of RAM, with SME turned off 
 open build/ArchBox.app
 ```
 
-The script builds a release binary, puts together `build/ArchBox.app`, and signs it ad hoc with the `com.apple.security.virtualization` entitlement.
+The script builds a release binary, puts together `build/ArchBox.app`, and signs it ad hoc with the entitlements in `Resources/ArchBox.entitlements`. With `SIGN_IDENTITY` set to a Developer ID, it signs for distribution instead.
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the app and publishes a GitHub release with `ArchBox-<version>.zip`. If the repository has the secrets `DEVELOPER_ID_P12`, `DEVELOPER_ID_P12_PASSWORD`, `NOTARY_KEY_P8`, `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID`, the release is signed with a Developer ID and notarized, and the workflow fails if the certificate holds no Developer ID identity. Without the secrets it is signed ad hoc.
 
 ## Files
 
@@ -85,3 +105,8 @@ To reinstall, quit the app and delete `disk.img` and `installed`.
 | `ARCHBOX_TEST=local\|ram\|network` | The installer runs a stress test instead of installing |
 | `ARCHBOX_DISK_BUS=nvme\|virtio` | Disk controller (default `nvme`) |
 | `ARCHBOX_CPUS`, `ARCHBOX_MEMORY_GB` | Override the CPU count and the memory size |
+| `ARCHBOX_DEV_SSH_KEY` | A public key. The installer enables sshd and authorizes the key for the user, so tests can reach the guest. |
+
+## License
+
+MIT, see [LICENSE](LICENSE). The exception is `Resources/guest/virtio-snd`, which is the Linux virtio sound driver under GPL-2.0-or-later.

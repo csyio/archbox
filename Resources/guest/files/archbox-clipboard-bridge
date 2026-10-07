@@ -1,0 +1,5 @@
+#!/bin/sh
+# spice-vdagent only sees the X11 clipboard, and KWin copies the Wayland clipboard
+# to X11 only while an X11 window has focus. Copy new Wayland text to X11 so
+# spice-vdagent can pass it to the Mac.
+exec wl-paste --type text --watch /usr/local/bin/archbox-clipboard-to-x11

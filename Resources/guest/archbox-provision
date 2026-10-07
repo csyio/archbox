@@ -88,6 +88,20 @@ if [ -n "${ARCHBOX_TEST:-}" ]; then
     exit 0
 fi
 
+# Mirrors sometimes stall mid-download; pacman keeps what it already fetched,
+# so a retry only fetches the rest.
+pacman_retry() {
+    local attempt
+    for attempt in 1 2 3; do
+        if ch pacman "$@"; then
+            return 0
+        fi
+        echo "pacman failed (attempt $attempt of 3), retrying in 10 seconds"
+        sleep 10
+    done
+    return 1
+}
+
 ch() {
     chroot "$TARGET" /usr/bin/env -i HOME=/root TERM=dumb LANG=C.UTF-8 \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/bin "$@"
@@ -147,14 +161,22 @@ printf 'nameserver %s\nnameserver 1.1.1.1\n' "$gateway" >"$TARGET/etc/resolv.con
 # ---------------------------------------------------------------------------
 step 4 "Initializing package keys"
 
-sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 8/' "$TARGET/etc/pacman.conf"
+# Mirrors stall on large files now and then; with two mirrors pacman moves on
+# to the next one, and pacman_retry covers the rest. HTTPS only: packages are
+# signed, but the Arch Linux ARM databases are not, so plain HTTP would let
+# anyone on the network serve stale databases and hold back updates.
+sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 4/' "$TARGET/etc/pacman.conf"
+cat >"$TARGET/etc/pacman.d/mirrorlist" <<'EOF'
+Server = https://de3.mirror.archlinuxarm.org/$arch/$repo
+Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo
+EOF
 ch pacman-key --init
 ch pacman-key --populate archlinuxarm
 
 # ---------------------------------------------------------------------------
 step 5 "Updating the base system"
 
-ch pacman -Syu --noconfirm --needed dosfstools
+pacman_retry -Syu --noconfirm --needed dosfstools
 
 # Move /boot onto the EFI system partition.
 ch mkfs.fat -F32 -n ARCHESP "${PART}1"
@@ -175,6 +197,7 @@ wanted=(
     noto-fonts noto-fonts-emoji noto-fonts-cjk
     spice-vdagent xdg-user-dirs bash-completion
     nano vim git base-devel htop fastfetch man-db openssh
+    dkms linux-aarch64-headers wl-clipboard xclip alsa-utils
 )
 pkgs=()
 for p in "${wanted[@]}"; do
@@ -184,7 +207,7 @@ for p in "${wanted[@]}"; do
         echo "WARNING: package not available, skipped: $p"
     fi
 done
-ch pacman -S --noconfirm --needed "${pkgs[@]}"
+pacman_retry -S --noconfirm --needed "${pkgs[@]}"
 
 # ---------------------------------------------------------------------------
 step 7 "Configuring the system"
@@ -214,6 +237,7 @@ cat >"$TARGET/etc/fstab" <<EOF
 LABEL=archroot  /      ext4  rw,relatime  0 1
 LABEL=ARCHESP   /boot  vfat  rw,relatime,fmask=0077,dmask=0077  0 2
 archbox-shared  /home/$ARCHBOX_USER/Mac  virtiofs  rw,nofail  0 0
+rosetta         /media/rosetta         virtiofs  ro,nofail  0 0
 EOF
 
 # Users: drop the default "alarm" account, lock root, use sudo.
@@ -252,7 +276,98 @@ Name=ArchBox first run
 Exec=/usr/local/bin/archbox-firstrun
 X-KDE-autostart-phase=2
 EOF
+# Clipboard: spice-vdagent only speaks X11, so it runs against XWayland. KWin
+# copies X11 -> Wayland on its own; archbox-clipboard-bridge does Wayland -> X11.
+install -m 755 /usr/local/share/archbox/files/archbox-clipboard-bridge \
+    /usr/local/share/archbox/files/archbox-clipboard-to-x11 "$TARGET/usr/local/bin/"
+# Sound: pick the profile that has the microphone (see the file for why).
+install -D -m 644 /usr/local/share/archbox/files/51-archbox-virtio-sound.conf \
+    "$TARGET/etc/wireplumber/wireplumber.conf.d/51-archbox-virtio-sound.conf"
+cat >"$home/.config/autostart/archbox-clipboard-bridge.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=ArchBox clipboard bridge
+Exec=/usr/local/bin/archbox-clipboard-bridge
+X-KDE-autostart-phase=2
+EOF
+cat >"$home/.config/autostart/spice-vdagent.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Spice vdagent (XWayland)
+Exec=env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 /usr/bin/spice-vdagent -x
+X-KDE-autostart-phase=2
+EOF
+# The Mac asks Linux to shut down with the power button (used when the VM
+# state cannot be saved). Plasma would show the logout screen; shut down instead.
+cat >"$home/.config/powerdevilrc" <<EOF
+[AC][SuspendAndShutdown]
+PowerButtonAction=8
+
+[Battery][SuspendAndShutdown]
+PowerButtonAction=8
+
+[LowBattery][SuspendAndShutdown]
+PowerButtonAction=8
+EOF
+# Copied Mac passwords reach Linux through the shared clipboard; don't let
+# Klipper keep clipboard history on disk.
+cat >"$home/.config/klipperrc" <<EOF
+[General]
+KeepClipboardContents=false
+EOF
+if [ -n "${ARCHBOX_DEV_SSH_KEY:-}" ] && [ -f "$TARGET/usr/lib/systemd/system/sshd.service" ]; then
+    # Development only: lets the developer reach the guest over ssh, key only.
+    mkdir -p "$home/.ssh" "$TARGET/etc/ssh/sshd_config.d"
+    printf '%s\n' "$ARCHBOX_DEV_SSH_KEY" >"$home/.ssh/authorized_keys"
+    chmod 700 "$home/.ssh"
+    chmod 600 "$home/.ssh/authorized_keys"
+    printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
+        >"$TARGET/etc/ssh/sshd_config.d/10-archbox-dev.conf"
+    ch systemctl enable sshd.service
+fi
 ch chown -R "$ARCHBOX_USER:$ARCHBOX_USER" "/home/$ARCHBOX_USER"
+
+# Sound: build the virtio sound driver the Arch Linux ARM kernel leaves out.
+# DKMS rebuilds it for every kernel update. A failed build only costs sound.
+kver=
+for dir in "$TARGET"/usr/lib/modules/*/; do
+    [ -f "$dir/modules.builtin" ] && kver=$(basename "$dir")
+done
+snd_dir=/usr/local/share/archbox/virtio-snd
+snd_version=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p' "$snd_dir/dkms.conf")
+snd_src="$TARGET/usr/src/virtio-snd-$snd_version"
+mkdir -p "$snd_src"
+cp "$snd_dir"/* "$snd_src/"
+if ch dkms install "virtio-snd/$snd_version" -k "$kver"; then
+    echo "virtio-snd built for $kver"
+else
+    echo "WARNING: virtio-snd did not build for $kver; there will be no sound"
+fi
+
+# Rosetta: run x86_64 Linux programs through the Mac's Rosetta, shared by the app.
+mkdir -p "$TARGET/media/rosetta" "$TARGET/usr/local/lib/archbox"
+printf '%s\n' ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/media/rosetta/rosetta:CF' \
+    >"$TARGET/usr/local/lib/archbox/rosetta.binfmt"
+cat >"$TARGET/etc/systemd/system/archbox-rosetta.service" <<EOF
+[Unit]
+Description=Register Rosetta for x86_64 binaries
+# Wants, not Requires: on a Mac without Rosetta the share is missing, and the
+# condition below should skip this unit instead of failing it.
+Wants=media-rosetta.mount
+After=media-rosetta.mount proc-sys-fs-binfmt_misc.mount systemd-binfmt.service
+# systemd-binfmt clears all registrations when it restarts; register again then.
+PartOf=systemd-binfmt.service
+ConditionPathExists=/media/rosetta/rosetta
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '[ -e /proc/sys/fs/binfmt_misc/rosetta ] || cat /usr/local/lib/archbox/rosetta.binfmt >/proc/sys/fs/binfmt_misc/register'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ch systemctl enable archbox-rosetta.service
 
 # After the Mac resumes a saved VM the guest clock is behind; poll NTP often
 # so it is corrected within a minute instead of up to half an hour.

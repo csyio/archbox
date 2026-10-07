@@ -169,8 +169,24 @@ final class Installer: NSObject, ObservableObject, VZVirtualMachineDelegate {
             ./etc/systemd/system/archbox-provision.service type=file uid=0 gid=0 mode=0644 contents=archbox-provision.service
             ./etc/systemd/system/multi-user.target.wants/archbox-provision.service type=link uid=0 gid=0 mode=0777 link=/etc/systemd/system/archbox-provision.service
             ./etc/systemd/system/serial-getty@hvc0.service type=link uid=0 gid=0 mode=0777 link=/dev/null
+            ./usr/local/share/archbox type=dir uid=0 gid=0 mode=0755
+            ./usr/local/share/archbox/virtio-snd type=dir uid=0 gid=0 mode=0755
+            ./usr/local/share/archbox/files type=dir uid=0 gid=0 mode=0755
 
             """
+        // Sources of the virtio sound driver (built with DKMS inside the guest)
+        // and helper scripts copied into the installed system.
+        for (folder, mode) in [("virtio-snd", "0644"), ("files", "0755")] {
+            let folderURL = guestDir.appendingPathComponent(folder)
+            let names = try FileManager.default.contentsOfDirectory(atPath: folderURL.path)
+            for name in names.sorted() where !name.hasPrefix(".") {
+                // Only regular files: a subfolder would make bsdtar fail the whole repack.
+                let values = try folderURL.appendingPathComponent(name).resourceValues(forKeys: [.isRegularFileKey])
+                guard values.isRegularFile == true else { continue }
+                let path = "./usr/local/share/archbox/\(folder)/\(name)"
+                overlay += "\(mtreeEscape(path)) type=file uid=0 gid=0 mode=\(mode) contents=\(mtreeEscape(folder + "/" + name))\n"
+            }
+        }
         // bsdtar's cpio writer drops hard links when repacking another archive
         // (e.g. mkfs.ext4 -> mke2fs), so re-add each one as a symlink. The later
         // entry wins when the kernel unpacks the initramfs.
@@ -264,6 +280,7 @@ final class Installer: NSObject, ObservableObject, VZVirtualMachineDelegate {
             ("ARCHBOX_DISK", VMConfig.guestDiskNames.0),
             ("ARCHBOX_TARBALL_DISK", VMConfig.guestDiskNames.1),
             ("ARCHBOX_TEST", ProcessInfo.processInfo.environment["ARCHBOX_TEST"] ?? ""),
+            ("ARCHBOX_DEV_SSH_KEY", ProcessInfo.processInfo.environment["ARCHBOX_DEV_SSH_KEY"] ?? ""),
         ]
         let text = values.map { "\($0.0)=\(shellQuote($0.1))" }.joined(separator: "\n") + "\n"
         // Owner-only from the first byte (FileManager.createFile writes a 0644 temp
